@@ -17,6 +17,14 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
+import java.util.Locale
+
+data class InferenceResult(
+    val summary: String,
+    val latencyMs: Long,
+    val tps: Double,
+    val memoryMb: Double
+)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -43,6 +51,10 @@ class MainActivity : ComponentActivity() {
 fun SummarizerUI(inferenceManager: InferenceManager) {
     var userInput by remember { mutableStateOf("") }
     var summaryResult by remember { mutableStateOf("") }
+    var latency by remember { mutableLongStateOf(0L) }
+    var tps by remember { mutableDoubleStateOf(0.0) }
+    var memory by remember { mutableDoubleStateOf(0.0) }
+    
     var isLoading by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -68,7 +80,11 @@ fun SummarizerUI(inferenceManager: InferenceManager) {
                 if (userInput.isNotBlank()) {
                     scope.launch {
                         isLoading = true
-                        summaryResult = runInference(context, inferenceManager, userInput)
+                        val result = runInference(context, inferenceManager, userInput)
+                        summaryResult = result.summary
+                        latency = result.latencyMs
+                        tps = result.tps
+                        memory = result.memoryMb
                         isLoading = false
                     }
                 }
@@ -97,6 +113,18 @@ fun SummarizerUI(inferenceManager: InferenceManager) {
                     text = "Result:",
                     style = MaterialTheme.typography.titleMedium
                 )
+                
+                if (summaryResult.isNotEmpty()) {
+                    Text(
+                        text = "Latency: $latency ms | TPS: ${String.format(Locale.US, "%.2f", tps)}",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Text(
+                        text = "Memory Delta: ${String.format(Locale.US, "%.2f", memory)} MB",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
                     text = if (summaryResult.isEmpty() && !isLoading) "Summary will appear here..." else summaryResult,
@@ -119,7 +147,7 @@ fun extractTokenizerModel(context: Context): String {
     return modelFile.absolutePath
 }
 
-suspend fun runInference(context: Context, inferenceManager: InferenceManager, userInput: String): String {
+suspend fun runInference(context: Context, inferenceManager: InferenceManager, userInput: String): InferenceResult {
     return withContext(Dispatchers.Default) {
         val modelPath = extractTokenizerModel(context)
         val tokenizer = TokenizerEngine()
@@ -130,15 +158,15 @@ suspend fun runInference(context: Context, inferenceManager: InferenceManager, u
             tokens.add(1) // Append EOS token
             Log.d("NEW_TAG", "Generated IDs: ${tokens.joinToString(", ")}")
 
-            val outputIds =
-                inferenceManager.generateSummary(tokens.map { it.toLong() }.toLongArray())
-            Log.d("NEW_TAG", "AI Output IDs: $outputIds")
+            val benchmark = inferenceManager.generateSummary(tokens.map { it.toLong() }.toLongArray())
+            Log.d("NEW_TAG", "AI Output IDs: ${benchmark.generatedIds}")
 
-            val intArray = outputIds.filter { it > 0L }.map { it.toInt() }.toIntArray()
+            val intArray = benchmark.generatedIds.filter { it > 0L }.map { it.toInt() }.toIntArray()
             val englishText = tokenizer.decode(intArray).replace(" ", " ").trim()
-            englishText
+            
+            InferenceResult(englishText, benchmark.latencyMs, benchmark.tps, benchmark.memoryUsedMb)
         } else {
-            "Failed to load tokenizer model."
+            InferenceResult("Failed to load tokenizer model.", 0L, 0.0, 0.0)
         }
     }
 }
