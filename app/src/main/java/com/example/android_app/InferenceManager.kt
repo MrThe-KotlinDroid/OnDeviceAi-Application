@@ -13,6 +13,14 @@ import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.nio.LongBuffer
 
+data class BenchmarkResult(
+    val generatedIds: List<Long>,
+    val latencyMs: Long,
+    val tokensGenerated: Int,
+    val tps: Double,
+    val memoryUsedMb: Double
+)
+
 class InferenceManager(private val context: Context) {
     private val ortEnv = OrtEnvironment.getEnvironment()
     private var encoderSession: OrtSession? = null
@@ -40,7 +48,9 @@ class InferenceManager(private val context: Context) {
     fun initEncoder() {
         try {
             val path = extractModel("encoder_model_int8.onnx")
-            encoderSession = ortEnv.createSession(path, OrtSession.SessionOptions())
+            val options = OrtSession.SessionOptions()
+            options.setIntraOpNumThreads(4)
+            encoderSession = ortEnv.createSession(path, options)
         } catch (e: Exception) {
             Log.e("NEW_TAG", "Error initializing encoder: ${e.message}")
         }
@@ -49,7 +59,9 @@ class InferenceManager(private val context: Context) {
     fun initDecoder() {
         try {
             val path = extractModel("decoder_model_merged_int8.onnx")
-            decoderSession = ortEnv.createSession(path, OrtSession.SessionOptions())
+            val options = OrtSession.SessionOptions()
+            options.setIntraOpNumThreads(4)
+            decoderSession = ortEnv.createSession(path, options)
         } catch (e: Exception) {
             Log.e("NEW_TAG", "Error initializing decoder: ${e.message}")
         }
@@ -118,7 +130,12 @@ class InferenceManager(private val context: Context) {
         }
     }
 
-    fun generateSummary(inputTokenIds: LongArray): List<Long> {
+    fun generateSummary(inputTokenIds: LongArray): BenchmarkResult {
+        // Benchmark: Start Memory Tracking
+        System.gc()
+        System.runFinalization()
+        val baseMem = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory() + android.os.Debug.getNativeHeapAllocatedSize()
+        
         val generatedTokens = mutableListOf<Long>(0L)
         val inputShape = longArrayOf(1, inputTokenIds.size.toLong())
 
@@ -127,8 +144,11 @@ class InferenceManager(private val context: Context) {
         val attentionMaskTensor = OnnxTensor.createTensor(ortEnv, createDirectLongBuffer(attentionMaskArray), inputShape)
 
         val encoderInputs = mapOf("input_ids" to inputIdsTensor, "attention_mask" to attentionMaskTensor)
+        
+        // Benchmark: Start Stopwatch
+        val startTime = System.nanoTime()
         val encoderOutput = encoderSession?.run(encoderInputs)
-        val encoderResultTensor = encoderOutput?.get(0) as? OnnxTensor ?: return emptyList()
+        val encoderResultTensor = encoderOutput?.get(0) as? OnnxTensor ?: return BenchmarkResult(emptyList(), 0, 0, 0.0, 0.0)
 
         // Detach C++ Memory
         val rawBuffer = encoderResultTensor.floatBuffer
@@ -146,7 +166,7 @@ class InferenceManager(private val context: Context) {
         var isFirstStep = true
 
         try {
-            for (step in 0 until 50) {
+            for (step in 0 until 150) {
                 val inputs = mutableMapOf<String, OnnxTensor>()
                 inputs["encoder_hidden_states"] = encoderHiddenStates
 
@@ -233,6 +253,15 @@ class InferenceManager(private val context: Context) {
             attentionMaskTensor.close()
         }
 
-        return generatedTokens
+        // Benchmark: End Stopwatch and Memory Tracking
+        val endTime = System.nanoTime()
+        val peakMem = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory() + android.os.Debug.getNativeHeapAllocatedSize()
+
+        val latencyMs = (endTime - startTime) / 1_000_000
+        val memoryUsedMb = (peakMem - baseMem) / (1024.0 * 1024.0)
+        val tokensGenerated = generatedTokens.size - 1 // Exclude start token (0L)
+        val tps = if (latencyMs > 0) (tokensGenerated.toDouble() * 1000.0 / latencyMs) else 0.0
+
+        return BenchmarkResult(generatedTokens, latencyMs, tokensGenerated, tps, memoryUsedMb)
     }
 }
